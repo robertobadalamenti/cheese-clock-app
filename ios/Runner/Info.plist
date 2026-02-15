@@ -26,6 +26,10 @@
 	<string>$(FLUTTER_BUILD_NUMBER)</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
+	<key>NSCameraUsageDescription</key>
+	<string>Questa app ha bisogno della fotocamera per scattare foto automatiche.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Questa app ha bisogno del microfono (richiesto dal plugin camera).</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

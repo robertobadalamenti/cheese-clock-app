@@ -1,121 +1,238 @@
+import 'dart:async';
+import 'dart:io';
+import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:opencv_dart/opencv_dart.dart' as cv;
 
-void main() {
+late List<CameraDescription> _cameras;
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  _cameras = await availableCameras();
   runApp(const MyApp());
 }
 
 class MyApp extends StatelessWidget {
   const MyApp({super.key});
+  @override
+  Widget build(BuildContext context) => MaterialApp(
+    theme: ThemeData.dark(),
+    home: const CameraPage(),
+    debugShowCheckedModeBanner: false,
+  );
+}
 
-  // This widget is the root of your application.
+class CameraPage extends StatefulWidget {
+  const CameraPage({super.key});
+  @override
+  State<CameraPage> createState() => _CameraPageState();
+}
+
+class _CameraPageState extends State<CameraPage> {
+  CameraController? controller;
+  bool isProcessing = false;
+  List<File> photos = [];
+
+  @override
+  void initState() {
+    super.initState();
+    initializeCamera();
+  }
+
+  Future<void> initializeCamera() async {
+    if (_cameras.isEmpty) return;
+    controller = CameraController(
+      _cameras[0],
+      ResolutionPreset.medium,
+      enableAudio: false,
+    );
+    await controller!.initialize();
+    if (mounted) setState(() {});
+  }
+
+  // Ordina i punti per il Warp
+  cv.VecPoint _sortPoints(cv.VecPoint src) {
+    final points = List.generate(src.length, (i) => src[i]);
+    points.sort((a, b) => (a.x + a.y).compareTo(b.x + b.y));
+    final tl = points.first;
+    final br = points.last;
+    points.sort((a, b) => (a.y - a.x).compareTo(b.y - b.x));
+    final tr = points.first;
+    final bl = points.last;
+    return cv.VecPoint.fromList([tl, tr, br, bl]);
+  }
+
+  Future<File> processWithOpenCV(XFile capturedFile) async {
+    // Inizializziamo le Mat come null per gestirle nel finally
+    cv.Mat? mat;
+    cv.Mat? finalBoard;
+    cv.Mat? finalEnhanced;
+
+    try {
+      mat = cv.imread(capturedFile.path);
+      if (mat == null || mat.isEmpty) return File(capturedFile.path);
+
+      // 1. Pre-processing
+      final gray = cv.cvtColor(mat, cv.COLOR_BGR2GRAY);
+      final blurred = cv.gaussianBlur(gray, (5, 5), 0);
+      final edged = cv.canny(blurred, 50, 150);
+
+      // 2. Trova contorni
+      final (contours, _) = cv.findContours(
+        edged,
+        cv.RETR_EXTERNAL,
+        cv.CHAIN_APPROX_SIMPLE,
+      );
+
+      cv.VecPoint? bestApprox;
+      if (contours.length > 0) {
+        double maxArea = 0;
+        for (int i = 0; i < contours.length; i++) {
+          final area = cv.contourArea(contours[i]);
+          if (area > 2000) {
+            final peri = cv.arcLength(contours[i], true);
+            final approx = cv.approxPolyDP(contours[i], 0.02 * peri, true);
+            if (approx.length == 4 && area > maxArea) {
+              bestApprox?.dispose();
+              bestApprox = _sortPoints(approx);
+              maxArea = area;
+            } else {
+              approx.dispose();
+            }
+          }
+        }
+      }
+
+      // 3. Warp o Fallback (assicuriamoci che finalBoard sia valida)
+      if (bestApprox != null) {
+        final dstPoints = cv.VecPoint.fromList([
+          cv.Point(0, 0),
+          cv.Point(800, 0),
+          cv.Point(800, 800),
+          cv.Point(0, 800),
+        ]);
+        final M = cv.getPerspectiveTransform(bestApprox!, dstPoints);
+        finalBoard = cv.warpPerspective(mat, M, (800, 800));
+
+        M.dispose();
+        dstPoints.dispose();
+        bestApprox!.dispose();
+      } else {
+        finalBoard = mat.clone(); // Fallback se non trova la scacchiera
+      }
+
+      // 4. Miglioramento (Uso di convertTo in modo sicuro)
+      // Creiamo prima la mat di destinazione per evitare che imwrite riceva un vuoto
+      finalEnhanced = cv.Mat.empty();
+      finalBoard.convertTo(finalEnhanced.type, alpha: 1.3, beta: 10);
+
+      // Se per qualche motivo convertTo fallisce, usiamo finalBoard direttamente
+      if (finalEnhanced.isEmpty) {
+        finalEnhanced.dispose();
+        finalEnhanced = finalBoard.clone();
+      }
+
+      // 5. Salvataggio
+      final Directory dir = await getTemporaryDirectory();
+      final String path =
+          "${dir.path}/board_${DateTime.now().millisecondsSinceEpoch}.jpg";
+
+      // Verifichiamo un'ultima volta prima di imwrite
+      if (!finalEnhanced.isEmpty) {
+        cv.imwrite(path, finalEnhanced);
+      } else {
+        throw Exception("Matrice ancora vuota prima del salvataggio");
+      }
+
+      return File(path);
+    } catch (e) {
+      debugPrint("ERRORE OPENCV: $e");
+      return File(
+        capturedFile.path,
+      ); // Ritorna l'originale in caso di errore totale
+    } finally {
+      // Pulizia rigorosa per evitare leak di memoria
+      mat?.dispose();
+      finalBoard?.dispose();
+      finalEnhanced?.dispose();
+    }
+  }
+
+  Future<void> captureAndProcess() async {
+    if (controller == null || isProcessing) return;
+
+    setState(() => isProcessing = true);
+
+    try {
+      final XFile file = await controller!.takePicture();
+      final File processed = await processWithOpenCV(file);
+
+      setState(() {
+        photos.insert(0, processed);
+        isProcessing = false;
+      });
+    } catch (e) {
+      debugPrint("Errore: $e");
+      setState(() => isProcessing = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+    if (controller == null || !controller!.value.isInitialized) {
+      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+    }
+    return Scaffold(
+      appBar: AppBar(title: const Text("Chess Scanner")),
+      body: Column(
+        children: [
+          AspectRatio(
+            aspectRatio: controller!.value.aspectRatio,
+            child: CameraPreview(controller!),
+          ),
+          const SizedBox(height: 20),
+          isProcessing
+              ? const CircularProgressIndicator()
+              : ElevatedButton.icon(
+                  onPressed: captureAndProcess,
+                  icon: const Icon(Icons.camera_alt),
+                  label: const Text("SCATTA E ELABORA"),
+                  style: ElevatedButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 30,
+                      vertical: 15,
+                    ),
+                  ),
+                ),
+          Expanded(
+            child: _PhotosGrid(), // Widget separato per pulizia
+          ),
+        ],
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
-
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
-
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
-}
-
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
-
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
-    });
-  }
-
+class _PhotosGrid extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
-    return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
+    final state = context.findAncestorStateOfType<_CameraPageState>()!;
+    return GridView.builder(
+      padding: const EdgeInsets.all(10),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 2,
+        crossAxisSpacing: 10,
+        mainAxisSpacing: 10,
       ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
-        child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
-          children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
-            ),
-          ],
+      itemCount: state.photos.length,
+      itemBuilder: (ctx, i) => ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.file(
+          state.photos[i],
+          fit: BoxFit.cover,
+          key: ValueKey(state.photos[i].path),
         ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
       ),
     );
   }
