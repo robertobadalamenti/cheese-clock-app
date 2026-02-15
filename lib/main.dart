@@ -83,13 +83,30 @@ class _CameraPageState extends State<CameraPage> {
       );
 
       if (foundGrid && corners.length == 49) {
-        debugPrint("🎯 Griglia 8x8 rilevata!");
-        final srcPoints = cv.VecPoint.fromList([
-          cv.Point(corners[0].x.toInt(), corners[0].y.toInt()),
-          cv.Point(corners[6].x.toInt(), corners[6].y.toInt()),
-          cv.Point(corners[48].x.toInt(), corners[48].y.toInt()),
-          cv.Point(corners[42].x.toInt(), corners[42].y.toInt()),
-        ]);
+        debugPrint("🎯 Griglia 7x7 trovata. Estrapolo i bordi per 8x8...");
+
+        // Funzione di utilità locale per estrapolare un punto esterno
+        // P0 è il punto più esterno trovato, P1 è il suo vicino interno
+        cv.Point extrapolate(cv.Point2f p0, cv.Point2f p1) {
+          double dx = p0.x - p1.x;
+          double dy = p0.y - p1.y;
+          return cv.Point((p0.x + dx).toInt(), (p0.y + dy).toInt());
+        }
+
+        // Estrapoliamo i 4 angoli "reali" della scacchiera
+        // Per l'angolo Top-Left: usiamo il punto 0 (prima riga/col) e il punto 8 (seconda riga/col, diagonale)
+        // Oppure più semplicemente usando i vicini ortogonali:
+
+        // Top-Left (TL)
+        final tl = extrapolate(corners[0], corners[8]);
+        // Top-Right (TR)
+        final tr = extrapolate(corners[6], corners[12]);
+        // Bottom-Right (BR)
+        final br = extrapolate(corners[48], corners[40]);
+        // Bottom-Left (BL)
+        final bl = extrapolate(corners[42], corners[36]);
+
+        final srcPoints = cv.VecPoint.fromList([tl, tr, br, bl]);
 
         final dstPoints = cv.VecPoint.fromList([
           cv.Point(0, 0),
